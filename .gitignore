@@ -1,0 +1,11 @@
+# Upstream repositories, cloned separately (see README.md)
+/lerobot/
+/openpi/
+
+__pycache__/
+*.pyc
+# Run outputs
+/libs/
+/runs/
+/eval/
+/outputs/
