@@ -418,6 +418,12 @@ class ExperienceAdapter(nn.Module):
     generic branch (two stages): there, declining a reference costs nothing, so the gate learns to open only for
     references that help.
 
+    `ref_isolation` (v8, v2 encoder): the encoder's context holds the references' tokens only (not the current call's)
+    and the summary gets no state difference to the current call, so a reference token carries its reference, and
+    how it relates to the current call reaches the adapter only through the retrieval's scalars. Without it (v2-v7) the
+    references' output tokens also carry the current call's image tokens and state, so any reference can serve as a
+    channel for a correction that does not depend on it (v7: other-task references helped as much as the real ones).
+
     `position` (where in a host block the cross-attention sits) is interpreted by the host attachment and stored with
     the adapter, since an adapter is trained for one position. `time_cond` conditions every cross-attention on the
     host's condition vector of size `cond_dim` (default: hidden_size).
@@ -458,6 +464,7 @@ class ExperienceAdapter(nn.Module):
         generic_cond_rank: int = 64,
         relevance: str = "none",
         relevance_hidden: int = 64,
+        ref_isolation: bool = False,
     ) -> None:
         super().__init__()
         assert position in self.POSITIONS, f"Unknown position {position}"
@@ -486,6 +493,10 @@ class ExperienceAdapter(nn.Module):
                                generic_cond_rank=int(generic_cond_rank))
         if gated:
             self.config.update(relevance=relevance, relevance_hidden=int(relevance_hidden))
+        # v8: the reference tokens carry the references only (see _encode_v2)
+        self.ref_isolation = bool(ref_isolation) and encoder == "v2"
+        if self.ref_isolation:
+            self.config.update(ref_isolation=True)
         if encoder == "v1":  # (creation order as before the v2 encoder existed: same initial weights per seed)
             self.step_mlp = nn.Sequential(nn.Linear(action_dim, hidden_size), nn.SiLU(),
                                           nn.Linear(hidden_size, hidden_size))
@@ -674,18 +685,27 @@ class ExperienceAdapter(nn.Module):
         segments = self.segment_mlp(padded.reshape(B, M, S, L * A)) + self.segment_emb + kind[1]
         # summary: [B, M, 1, d]
         ref_state, cur_state = exp["ref_state"].to(dtype), exp["cur_state"].to(dtype)
-        summary_in = torch.cat([exp["scalars"].to(dtype), exp["success"].to(dtype)[..., None], ref_state,
-                                ref_state - cur_state[:, None]], dim=-1)
+        relative = ref_state - cur_state[:, None]
+        if self.ref_isolation:  # v8: nothing of the current call in the reference tokens
+            relative = torch.zeros_like(relative)
+        summary_in = torch.cat([exp["scalars"].to(dtype), exp["success"].to(dtype)[..., None], ref_state, relative],
+                               dim=-1)
         summary = (self.summary_mlp(summary_in) + kind[0])[:, :, None]
-        # image tokens: [B, M, V, d] and [B, V, d]
+        # image tokens: [B, M, V, d] (and the current call's [B, V, d])
         ref_vis = self.vis_in(exp["ref_vis"].to(dtype)) + self.vis_pos + kind[2]
-        cur_vis = self.vis_in(exp["cur_vis"].to(dtype)) + self.vis_pos + kind[4]
         per_ref = torch.cat([summary, segments, ref_vis], dim=2) + self.slot_emb[:M, None]  # [B, M, T, d]
         T = per_ref.shape[2]
-        current = torch.cat([(self.current_mlp(cur_state) + kind[3])[:, None], cur_vis], dim=1)  # [B, 1 + V, d]
-        sequence = torch.cat([per_ref.flatten(1, 2), current], dim=1)
         ref_valid = valid[:, :, None].expand(B, M, T).flatten(1)  # [B, M*T]
-        keep = torch.cat([ref_valid, ref_valid.new_ones(B, current.shape[1])], dim=1)  # current tokens: always
+        if self.ref_isolation:
+            sequence = per_ref.flatten(1, 2)
+            # a row without references would have every key masked (NaN): keep its first (unread) token
+            keep = ref_valid.clone()
+            keep[:, 0] |= ~active
+        else:
+            cur_vis = self.vis_in(exp["cur_vis"].to(dtype)) + self.vis_pos + kind[4]
+            current = torch.cat([(self.current_mlp(cur_state) + kind[3])[:, None], cur_vis], dim=1)  # [B, 1 + V, d]
+            sequence = torch.cat([per_ref.flatten(1, 2), current], dim=1)
+            keep = torch.cat([ref_valid, ref_valid.new_ones(B, current.shape[1])], dim=1)  # current tokens: always
         out = self.context(sequence, src_key_padding_mask=~keep)[:, : M * T]  # [B, M*T, d]
         tokens = torch.cat([self.null_token.expand(B, 1, -1), self.out_proj(self.out_norm(out))], dim=1)
         attend = torch.cat([torch.ones_like(ref_valid[:, :1]), ref_valid], dim=1)

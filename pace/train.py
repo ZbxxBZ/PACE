@@ -62,6 +62,36 @@ succeeded); --mixed_weight w draws the successes of mixed variants w times as of
 change the outcome); --max_same_variant k keeps 1..k of the own variant's attempts (a 3-round evaluation stores 1 or
 2). Validation also reports val10_* (the first n_action_steps steps, what the closed loop executes; the best adapter
 is picked by val10_real) and val10_mixed_* (held-out mixed variants).
+v8 targets what v7 (B: --loss_steps 10) learned instead of experience - every reference, other tasks' too, lowered the
+loss about as much as the real ones: --ref_isolation 1 keeps the current call out of the reference tokens (the channel
+for a reference-independent correction), --anchor_bad w makes samples with wrong references (other task, misaligned)
+match the host in either direction, --adhere_symmetric 1 does the same for the adherence negatives.
+v9 adds corrective samples (--p_corrective q): v8 learned to follow the aligned references, which at a failing attempt's
+observation reinforces the failure's own way (the references aligned to its state show what it does anyway). Where a
+mixed variant's success S and failure F part (PMA-aligned states, `corrective_items`: the first call whose aligned
+state distance exceeds --corr_thr twice in a row), the --corr_window calls before it give samples of F's observation
+with S's aligned action as the target and the usual references (successes only, as at evaluation; --anchor_bad and the
+adherence negatives apply as to any sample), q of each step's episodes. Validation adds the corrective test on the
+held-out mixed variants: at F's observation, the loss of S's and of F's own action per condition (val_corr_*); a
+reference that tells which way to go lowers the first more than the second (val_corr_<c>_gain > 0), and
+adapter_best_corr.pt keeps the largest real gain; val_succ_* is the same test at the successes' observations (their
+own way must stay preferred: gain not below 0). --corr_relative 1 trains a corrective sample on its loss relative to
+the host's (times --corr_scale): absolute, the few corrective calls (host loss ~25x a plain call's) took ~90% of the
+gradient and the adapter learned a reference-independent shift that already hurt the plain held-out loss.
+--corr_label branch takes the corrective targets from counterfactual branching instead (`branch_items`, --branches):
+F's env replayed exactly up to a call j just before it parts, then the base policy continued K times; the executed
+actions of each branch that succeeded are a causal label for F's observation at j (aligned success actions were only
+a proxy: ahead of F's progress in ~2/3 of the items). val_corr_* then tests the held-out failures' branch labels;
+val_succ_* keeps the same-phase items' success side.
+v9 v2 (--recovery, --p_recovery q): the branch-call labels carry no information (a failure's own action there is as
+close to the successful branches' as they are to each other; the branches part a median 8 calls later), so the
+corrective signal becomes the successful branches' whole continuations, rendered into the rollout format
+(render_branches.py): recovery samples (`recovery_items`) are a successful branch's calls after its branch point, on
+its own observations, with its executed chunks as targets, drawn around where the branches part (--rec_window) and
+equally per branch point; q of each step's episodes, references and conditions as for any sample. --rec_contrast w
+adds a bounded preference for the successful branch's action over the failed branch's at the same call. Rendered
+branches are never plain targets, references or validation episodes. Validation adds the recovery test (val_rec_*,
+held-out variants' branch points; adapter_best_rec.pt keeps the largest real gain).
 --ref_content `unaligned` trains a control adapter reading a random step of each reference; `self`
 is a sanity check where every reference is the demo's own chunk, perfectly aligned (can the adapter copy?).
 Every --val_every steps, held-out demos are scored with aligned / unaligned / other-task / no references on identical
@@ -128,11 +158,16 @@ class Demos:
         self.sig = [ep["sig"] if ep["sig"] is not None else ep["keys"][0] for ep in episodes]
         self.success = [bool(ep["success"]) for ep in episodes]
         self.variant = self.stratum = None
+        # v9 v2 (--recovery): rendered counterfactual branches (render_branches.py), (F's name, branch call) or None;
+        # never targets, references or validation episodes of their own (split_episodes), only recovery samples
+        self.branch = [None] * len(episodes)
         if self.rollouts:
             self.indices = [frames.index[ep["name"]] for ep in episodes]
             self.variant = [int(ep["meta"]["task_id"]) for ep in episodes]
             # the variant's LIBERO-plus category and difficulty (eval_suite's row fields), for a stratified split
             self.stratum = [(ep["meta"].get("category"), ep["meta"].get("difficulty")) for ep in episodes]
+            self.branch = [(ep["meta"]["branch_of"], int(ep["meta"]["branch_call"])) if ep["meta"].get("branch_of")
+                           else None for ep in episodes]
         else:
             self.indices = [list(ep["meta"]["dataset_indices"]) for ep in episodes]
         for i, ep in enumerate(episodes):
@@ -145,8 +180,13 @@ class Demos:
         for i, task in enumerate(self.task):
             self.by_task[task].append(i)
         if self.rollouts:
-            print(f"[demos] rollouts: {sum(self.success)} successes of {len(self)}, {len(set(self.variant))} variants, "
-                  f"{sum(len(i) for i in self.indices)} calls", flush=True)
+            own = [i for i in range(len(self)) if self.branch[i] is None]
+            print(f"[demos] rollouts: {sum(self.success[i] for i in own)} successes of {len(own)}, "
+                  f"{len(set(self.variant))} variants, {sum(len(self.indices[i]) for i in own)} calls", flush=True)
+            if len(own) < len(self):
+                rendered = [i for i in range(len(self)) if self.branch[i] is not None]
+                print(f"[demos] rendered branches: {len(rendered)} ({sum(self.success[i] for i in rendered)} "
+                      f"successful) of {len({self.branch[i] for i in rendered})} branch points", flush=True)
         print(f"[demos] {len(self)} {'rollouts' if self.rollouts else 'demos'} of {len(self.by_task)} tasks"
               + (f"; features: image tokens {tuple(self.vis[0].shape[1:])}, state {self.state[0].shape[1]}"
                  if self.features else "; no image tokens (v1 encoder only)")
@@ -211,7 +251,9 @@ class Alignments:
         # v7 rollouts: a query's other attempts of its own variant are candidates even when held out (as the store of
         # a later round holds them); failed attempts only with --ref_failures 1
         self.variants = torch.tensor(demos.variant) if demos.variant is not None else None
-        self.referable = torch.tensor([s or bool(getattr(args, "ref_failures", 0)) for s in demos.success])
+        # v9 v2: rendered branches are never references (the store at evaluation holds recorded attempts only)
+        self.referable = torch.tensor([(s or bool(getattr(args, "ref_failures", 0))) and b is None
+                                       for s, b in zip(demos.success, demos.branch)])
         assert self.variants is None or self.v3, "rollouts (v7) need the v3 retrieval"
         train = set(train_indices)
         sig = torch.stack(demos.sig).float().cuda()
@@ -548,13 +590,25 @@ def sample_frames(T, group_size, rng):
     return np.concatenate([np.arange(T), np.full(group_size - T, T - 1)])  # pad with the last call
 
 
-def make_plan(demos, episodes, refs, conditions, frames, rng, args, negs=None):
+# training conditions whose references are wrong by construction (--anchor_bad: these samples must equal the host)
+BAD_CONDITIONS = ("other_task", "unaligned")
+
+
+def make_plan(demos, episodes, refs, conditions, frames, rng, args, negs=None, targets=None, alts=None):
     """
     Dataset indices and adapter inputs of the calls `frames[k]` of `episodes[k]` reading `refs[k]`; with `negs`
-    (per episode None or (refs, unaligned)), also the negative adapter inputs and the per-call adherence mask.
+    (per episode None or (refs, unaligned)), also the negative adapter inputs and the per-call adherence mask. v9
+    `targets`: per episode None (its own executed chunks) or [len(frames[k]), chunk, A] chunks to learn instead (a
+    corrective sample: a failure's calls with the aligned success's actions); plan["corrective"] marks those rows.
+    v9 v2 `alts`: per episode None or (chunks [len(frames[k]), chunk, A], mask [len(frames[k])]) - a recovery sample's
+    contrast (the failed branch's chunks); plan["recovery"] marks the recovery rows, plan["rec_contrast"] the rows whose
+    contrast term applies (a chunk exists and the sample reads real references).
     """
-    indices, exp_parts, neg_parts, adhere = [], [], [], []
+    indices, exp_parts, neg_parts, adhere, bad, corrective = [], [], [], [], [], []
+    recovery, contrast, alt_chunks = [], [], []
     negs = negs or [None] * len(episodes)
+    targets = targets or [None] * len(episodes)
+    alts = alts or [False] * len(episodes)  # False: not a recovery sample; None: one without a failed branch
     features = args.encoder == "v2"
     n_scalars = len(V3_SCALAR_NAMES if args.retrieval == "v3" else SCALAR_NAMES)
     # v2: only the slots a sample can fill (<= num_refs); empty slots are masked, so this equals max_refs slots
@@ -565,11 +619,25 @@ def make_plan(demos, episodes, refs, conditions, frames, rng, args, negs=None):
         neg_parts.append(reference_batch(demos, episode, frame, None if neg is None else neg[0],
                                          neg is not None and neg[1], rng, slots, features, n_scalars))
         adhere += [neg is not None] * len(frame)
+        bad += [condition in BAD_CONDITIONS] * len(frame)
         indices.extend(demos.indices[episode][int(f)] for f in frame)
+    for frame, target in zip(frames, targets):
+        corrective += [target is not None] * len(frame)
     cat = lambda parts: {key: torch.cat([p[key] for p in parts]) for key in parts[0]}  # noqa: E731
+    chunks = [demos.actions[e][torch.as_tensor(f)] if t is None else t.to(demos.actions[e].dtype)
+              for e, f, t in zip(episodes, frames, targets)]
+    for chunk, alt, condition in zip(chunks, alts, conditions):
+        recovery += [alt is not False] * len(chunk)
+        if alt:
+            alt_chunks.append(alt[0].to(chunk.dtype))
+            contrast += (alt[1] & (condition == args.ref_content)).tolist()
+        else:
+            alt_chunks.append(chunk)  # placeholder, never scored
+            contrast += [False] * len(chunk)
     return {"indices": indices, "exp": cat(exp_parts), "neg_exp": cat(neg_parts), "adhere": torch.tensor(adhere),
-            "conditions": conditions,
-            "chunks": torch.cat([demos.actions[e][torch.as_tensor(f)] for e, f in zip(episodes, frames)])}
+            "conditions": conditions, "bad": torch.tensor(bad), "corrective": torch.tensor(corrective),
+            "chunks": torch.cat(chunks), "recovery": torch.tensor(recovery, dtype=torch.bool),
+            "rec_contrast": torch.tensor(contrast, dtype=torch.bool), "rec_alt": torch.cat(alt_chunks)}
 
 
 class PlanSampler:
@@ -636,18 +704,21 @@ def split_episodes(demos, args, rng):
               f"({dict(counts)}) of {len(variants)}", flush=True)
     else:
         held = {variants[k] for k in order[:n_held]}
-    targets = [i for i in range(len(demos)) if demos.variant[i] not in held and demos.success[i]]
-    val = [i for i in range(len(demos)) if demos.variant[i] in held and demos.success[i]]
-    universe = [i for i in range(len(demos))
-                if demos.variant[i] not in held and (demos.success[i] or args.ref_failures)]
+    own = [i for i in range(len(demos)) if demos.branch[i] is None]  # v9 v2: rendered branches are none of these
+    targets = [i for i in own if demos.variant[i] not in held and demos.success[i]]
+    val = [i for i in own if demos.variant[i] in held and demos.success[i]]
+    universe = [i for i in own if demos.variant[i] not in held and (demos.success[i] or args.ref_failures)]
+    demos.held_variants = held  # v9 v2: the recovery samples of these variants are validation only
     return targets, val, universe
 
 
 def variant_outcomes(demos):
-    """v7 rollouts: variant -> "success" (all its attempts succeeded), "mixed" or "fail" (none did)."""
+    """v7 rollouts: variant -> "success" (all its attempts succeeded), "mixed" or "fail" (none did); the recorded
+    attempts only (v9 v2: not the rendered branches)."""
     outcomes = collections.defaultdict(list)
-    for v, s in zip(demos.variant, demos.success):
-        outcomes[v].append(s)
+    for v, s, b in zip(demos.variant, demos.success, demos.branch):
+        if b is None:
+            outcomes[v].append(s)
     return {v: "success" if all(s) else ("fail" if not any(s) else "mixed") for v, s in outcomes.items()}
 
 
@@ -668,6 +739,156 @@ def target_weights(demos, train_indices, args):
     return weights / weights.sum()
 
 
+def corrective_items(demos, variants, args):
+    """
+    v9: the corrective samples of the given (mixed) variants: ({failure F: [(F's call j, success S, S's call t)]},
+    success-failure pairs, pairs that part). Every success S is PMA-aligned (robot states in the cost, as the
+    retrieval aligns) to its variant's failed attempts; a pair parts at the first call p where F's aligned state is
+    farther than --corr_thr (mean squared difference of the normalized states) at p and p + 1, and the --corr_window
+    calls t before p give F's aligned calls j (the states still close, the actions already apart); the label is S's
+    call t (--corr_label parting) or S's step at F's progress (same_phase: F's call j aligned back to S).
+    """
+    by_variant = collections.defaultdict(lambda: ([], []))
+    for i, (v, s) in enumerate(zip(demos.variant, demos.success)):
+        if v in variants and demos.branch[i] is None:
+            by_variant[v][0 if s else 1].append(i)
+    same_phase = getattr(args, "corr_label", "parting") == "same_phase"
+    items, n_pairs, n_parted = collections.defaultdict(list), 0, 0
+    for v, (succ, fail) in sorted(by_variant.items()):
+        if not succ or not fail:
+            continue
+        for s in succ:
+            ends = align(demos, s, fail, args)[0]  # [T_s, len(fail)]
+            for c, f in enumerate(fail):
+                n_pairs += 1
+                d = ((demos.state[s].float() - demos.state[f][ends[:, c]].float()) ** 2).mean(dim=1)
+                far = d > args.corr_thr
+                hits = torch.nonzero(far[:-1] & far[1:])[:, 0]
+                if not len(hits):
+                    continue
+                n_parted += 1
+                p = int(hits[0])
+                # --corr_label same_phase: the label is S's step at F's own progress (F aligned to S, the direction
+                # retrieval aligns), not S's call t: aligned from S, t is ahead of F's progress in ~2/3 of the items
+                # (median +1 call, F lags), and a delta-pose action from a later phase is wrong at F's position
+                back = align(demos, f, [s], args)[0][:, 0] if same_phase else None  # [T_f]
+                seen = set()
+                for t in range(max(0, p - args.corr_window), p):
+                    j = int(ends[t, c])
+                    label = int(back[j]) if same_phase else t
+                    if (j, label) not in seen:
+                        seen.add((j, label))
+                        items[f].append((j, s, label))
+    return dict(items), n_pairs, n_parted
+
+
+def branch_items(demos, variants, args):
+    """
+    v9 --corr_label branch: the corrective samples of the given variants from counterfactual branching
+    (branch_collect.py files --branches/--branch_glob): {failure F: [(branch call j, -1, label chunk)]}, one item per
+    successful branch (its executed normalized actions from j on, cut / padded with the last to the chunk length), and
+    counts. A point whose replay or recorded state at j disagrees with F's (another attempt of the same name) is dropped.
+    """
+    import glob
+    by_name = {n: i for i, n in enumerate(demos.names)}
+    items, counts = collections.defaultdict(list), collections.Counter()
+    files = sorted(glob.glob(os.path.join(args.branches, args.branch_glob)))
+    for path in files:
+        for r in torch.load(path, map_location="cpu", weights_only=False):
+            e = by_name.get(r["name"])
+            if e is None or demos.variant[e] not in variants or demos.success[e]:
+                continue
+            counts["points"] += 1
+            j, C = int(r["branch_call"]), demos.actions[e].shape[1]
+            first = r["branches"][0]["states"]
+            if (r["replay_state_diff"] > 1e-3 or not len(first) or j >= len(demos.indices[e])
+                    or float((first[0] - demos.state[e][j].float()).abs().max()) > 1e-3):
+                counts["mismatched"] += 1
+                continue
+            ok = [b for b in r["branches"] if b["success"] and len(b["actions"])]
+            counts["branches"] += len(r["branches"])
+            counts["succeeded"] += len(ok)
+            counts["labeled"] += bool(ok)
+            for b in ok:
+                a = b["actions"][:C].float()
+                if len(a) < C:
+                    a = torch.cat([a, a[-1:].expand(C - len(a), -1)])
+                assert a.shape == demos.actions[e].shape[1:], f"{r['name']}: label {tuple(a.shape)} vs chunks"
+                items[e].append((j, -1, a))
+    counts["files"] = len(files)
+    return dict(items), counts
+
+
+def item_label(demos, other, t):
+    """A corrective item's target chunk: the other episode's call t, or (branch items, other -1) the chunk t itself."""
+    return t if other < 0 else demos.actions[other][t]
+
+
+def recovery_items(demos, variants, args):
+    """
+    v9 v2 --recovery: the recovery samples of the given variants, from the rendered counterfactual branches (Demos'
+    branch episodes: F's calls 0..j-1, then the branch's calls j.. on its own observations). Every successful branch
+    is a demonstration of how the base policy got out of F's state: its calls j.. (never the shared prefix) with its
+    executed chunks as targets, drawn with position weights - 1 at d = call - j in [lo, hi) (--rec_window; the branches
+    of a point part a median 8 calls after j, 90 %: 20) except the last --rec_tail calls before the success, else
+    --rec_out_weight; each branch point weighs 1 in total (a point where 1 of 5 branches succeeded gives its only
+    success the weight of five of an easy point's). The point's rendered failed branch (if any) gives the contrast
+    chunks. Returns ({successful branch episode: (calls, weights, failed branch episode or -1, episode weight)},
+    counts).
+    """
+    points = collections.defaultdict(lambda: ([], []))
+    for i, b in enumerate(demos.branch):
+        if b is not None and demos.variant[i] in variants:
+            points[b][0 if demos.success[i] else 1].append(i)
+    lo, hi = args.rec_window
+    items, counts = {}, collections.Counter()
+    for (_, j), (succ, fail) in sorted(points.items()):
+        counts["points"] += 1
+        counts["no_success"] += not succ
+        counts["with_failure"] += bool(succ and fail)
+        for e in succ:
+            T = demos.actions[e].shape[0]
+            d = np.arange(T - j)
+            w = np.where((d >= lo) & (d < hi) & (d < T - j - args.rec_tail), 1.0, args.rec_out_weight)
+            items[e] = (np.arange(j, T), w, fail[0] if fail else -1, 1.0 / len(succ))
+            counts["branches"] += 1
+            counts["calls"] += T - j
+            counts["window_calls"] += int((w == 1.0).sum())
+    return items, counts
+
+
+def recovery_contrast(demos, alt, frame):
+    """The failed branch's chunks at the calls `frame` and where it has them ((chunks, mask); None without one)."""
+    if alt < 0:
+        return None
+    T = demos.actions[alt].shape[0]
+    calls = torch.as_tensor(np.minimum(frame, T - 1))
+    return demos.actions[alt][calls], torch.as_tensor(frame < T)
+
+
+def recovery_val_items(demos, items, args):
+    """
+    v9 v2: the recovery test's items ({successful branch episode: [(call, failed branch episode, call)]}): of held-out
+    branch points with both outcomes rendered, one successful branch each (at most --rec_val_points points) and up to
+    --rec_val_calls of its window calls where the failed branch has a call too (seeded, fixed for the run).
+    """
+    rng = np.random.default_rng(args.seed + 7)
+    by_point = collections.defaultdict(list)
+    for e, (_, _, alt, _) in items.items():
+        if alt >= 0:
+            by_point[demos.branch[e]].append(e)
+    points, out = sorted(by_point), {}
+    for k in rng.permutation(len(points))[: args.rec_val_points]:
+        its = sorted(by_point[points[k]])
+        e = its[int(rng.integers(len(its)))]
+        calls, w, alt, _ = items[e]
+        ok = calls[(w == 1.0) & (calls < demos.actions[alt].shape[0])]
+        if len(ok):
+            chosen = np.sort(rng.choice(ok, size=min(len(ok), args.rec_val_calls), replace=False))
+            out[e] = [(int(c), alt, int(c)) for c in chosen]
+    return out
+
+
 def load_training_data(policy, args):
     """
     (store, Demos, dataset factory). Demos: the library's demos, frames from its LeRobot dataset. v7 (--rollouts): the
@@ -678,7 +899,8 @@ def load_training_data(policy, args):
         store = ExperienceStore.load(args.library)
         return store, Demos(store, args.max_episodes), lambda: load_dataset(
             policy, args.dataset_repo_id, args.dataset_root, args.video_backend, parse_camera_map(args.camera_map))
-    files, frames = rollout_store_files(args.rollouts), frame_files(args.rollouts)
+    dirs = list(args.rollouts) + list(getattr(args, "recovery", None) or [])  # v9 v2: + the rendered branches
+    files, frames = rollout_store_files(dirs), frame_files(dirs)
     if not files or not frames:
         raise SystemExit(f"--rollouts {args.rollouts}: no rollouts_*.pt / frames_*.pt (record them with "
                          "pace.eval_suite --record_frames)")
@@ -752,7 +974,27 @@ def training_loss(policy, pace, batch, plan, args):
     """
     actions_all = batch[ACTION].float()
     B, device = actions_all.shape[0], actions_all.device
+    head = int(getattr(args, "loss_steps", 0) or 0)
+
+    def chunk_loss(prefix, actions, noise, time_):
+        """[B]: the flow-matching loss over the whole chunk, or (--loss_steps H) over its first H steps."""
+        if not head:
+            return flow_loss(policy, prefix, actions, noise=noise, time=time_)
+        return flow_loss(policy, prefix, actions, noise=noise, time=time_, per_step=True)[:, :head].mean(dim=1)
+
     mask_all = plan["adhere"].to(device).float()
+    corr_all = plan["corrective"].to(device) if "corrective" in plan else None  # v9: corrective rows (stats only)
+    n_corr = int(corr_all.sum()) if corr_all is not None else 0
+    # v9 v2: recovery rows (stats) and the rows of the contrast term (--rec_contrast)
+    rec_all = plan["recovery"].to(device) if "recovery" in plan else None
+    n_rec = int(rec_all.sum()) if rec_all is not None else 0
+    contrast_w = float(getattr(args, "rec_contrast", 0.0) or 0.0)
+    con_all = plan["rec_contrast"].to(device) if contrast_w and "rec_contrast" in plan else None
+    n_con = int(con_all.sum()) if con_all is not None else 0
+    relative_corr = bool(getattr(args, "corr_relative", 0))
+    anchor = float(getattr(args, "anchor_bad", 0.0) or 0.0)
+    bad_all = plan["bad"].to(device) if anchor and "bad" in plan else None
+    symmetric = bool(getattr(args, "adhere_symmetric", 0))
     use_all = args.adhere != "none" and bool(mask_all.any())
     n_total = mask_all.sum().clamp(min=1.0)
     eps = 1e-6
@@ -765,6 +1007,7 @@ def training_loss(policy, pace, batch, plan, args):
         exp = plan["exp"] if whole else {key: take(v, rows, B) for key, v in plan["exp"].items()}
         neg_exp = plan["neg_exp"] if whole else {key: take(v, rows, B) for key, v in plan["neg_exp"].items()}
         actions, mask = sub[ACTION].float(), mask_all[rows.to(device)]
+        bad = bad_all[rows.to(device)] if bad_all is not None else None
         use = use_all and bool(mask.any())
         prefix = prefix_cache(policy, sub)
         for _ in range(args.repeats):
@@ -776,19 +1019,70 @@ def training_loss(policy, pace, batch, plan, args):
                 for name, value in pace.adapter.relevance_stats.items():
                     relevance[name] += value
                 n_relevance += 1
-            l_real = flow_loss(policy, prefix, actions, noise=noise, time=time_)
-            loss = l_real.sum() / B
+            l_real = chunk_loss(prefix, actions, noise, time_)
+            per_sample = l_real
+            corr = corr_all[rows.to(device)] if n_corr else None
+            has_bad = bad is not None and bool(bad.any())
+            relative = corr is not None and bool(corr.any()) and relative_corr
+            l_host = None
+            if has_bad or relative:
+                pace.set_exp(None)
+                with torch.no_grad():
+                    l_host = chunk_loss(prefix, actions, noise, time_)
+            if has_bad:
+                # v8 --anchor_bad: a sample read with wrong references (other task, misaligned) must leave the host's
+                # loss unchanged in EITHER direction: a gain there is a correction that does not depend on the
+                # reference (v7 learned one), not the use of experience
+                shift = l_real - l_host
+                per_sample = torch.where(bad, anchor * shift.abs(), l_real)
+                stats["bad_shift"] += float(shift.detach()[bad].sum()) / B / args.repeats
+                stats["bad_abs_shift"] += float(shift.detach().abs()[bad].sum()) / B / args.repeats
+            if corr is not None:
+                stats["corr_l_real"] += float(l_real.detach()[corr].sum()) / n_corr / args.repeats
+            if relative:
+                # v9 --corr_relative: a corrective sample's term (its loss, or its anchor) relative to the host's loss
+                # on it, times --corr_scale (the plain samples' loss level): the host is far from the success's action
+                # at a failure's observation (~25x a plain sample's loss), which would hand most of the gradient to
+                # the few corrective calls; this way each weighs as a plain sample and counts the fraction it improves
+                scale = args.corr_scale / l_host.clamp(min=1e-6)
+                per_sample = torch.where(corr, per_sample * scale, per_sample)
+                stats["corr_rel"] += float((l_real.detach() / l_host.clamp(min=1e-6))[corr].sum()) / n_corr / args.repeats
+            loss = per_sample.sum() / B
             stats["l_real"] += float(l_real.detach().sum()) / B / args.repeats
+            if n_rec:
+                rec = rec_all[rows.to(device)]
+                stats["rec_l_real"] += float(l_real.detach()[rec].sum()) / n_rec / args.repeats
+            con = con_all[rows.to(device)] if n_con else None
+            if con is not None and bool(con.any()):
+                # v9 v2 contrast: at a successful branch's observation, the adapter must prefer its action over the
+                # failed branch's (same call after the branch point) by a relative margin beyond the host's own
+                # preference: relu(m - [(log L_alt - log L_own)_adapter - (log L_alt - log L_own)_host]); gradients
+                # through both losses, bounded by the margin (no unlimited push of the failed action's loss)
+                alt = plan["rec_alt"][rows].to(device, actions.dtype)
+                pace.set_exp(exp)
+                l_alt = chunk_loss(prefix, alt, noise, time_)
+                pace.set_exp(None)
+                with torch.no_grad():
+                    l_alt_host = chunk_loss(prefix, alt, noise, time_)
+                    if l_host is None:
+                        l_host = chunk_loss(prefix, actions, noise, time_)
+                gap = (torch.log(l_alt + eps) - torch.log(l_real + eps))                     - (torch.log(l_alt_host + eps) - torch.log(l_host + eps))
+                term = F.relu(args.rec_margin - gap)
+                loss = loss + contrast_w * term[con].sum() / B
+                stats["rec_gap"] += float(gap.detach()[con].sum()) / n_con / args.repeats
+                stats["rec_contrast_active"] += float((term.detach()[con] > 0).float().sum()) / n_con / args.repeats
             if use:
                 pace.set_exp(neg_exp)
-                l_neg = flow_loss(policy, prefix, actions, noise=noise, time=time_)
+                l_neg = chunk_loss(prefix, actions, noise, time_)
                 n = n_total
                 if args.adhere == "pace":
                     pace.set_exp(None)
                     with torch.no_grad():
-                        l_base = flow_loss(policy, prefix, actions, noise=noise, time=time_)
+                        l_base = chunk_loss(prefix, actions, noise, time_)
                     rank = F.relu(torch.log(l_real + eps) - torch.log(l_neg.detach() + eps) + args.adhere_margin)
-                    harm = F.relu(torch.log(l_neg + eps) - torch.log(l_base + eps))
+                    harm = torch.log(l_neg + eps) - torch.log(l_base + eps)
+                    # v8 --adhere_symmetric: the negative must not help either (|.|), not only not hurt (relu)
+                    harm = harm.abs() if symmetric else F.relu(harm)
                     loss = loss + (args.adhere_rank * rank + args.adhere_harm * harm).mul(mask).sum() / n
                     stats["rank_active"] += float(((rank > 0).float() * mask).sum() / n) / args.repeats
                     stats["harm"] += float((harm.detach() * mask).sum() / n) / args.repeats
@@ -920,6 +1214,112 @@ def validate(policy, pace, batches, preprocessor, prompts, args, mixed=None):
     return result
 
 
+CORR_CONDITIONS = ("real", "novariant", "other_task", "unaligned", "none")
+
+
+def build_corrective_validation(demos, alignments, items, dataset, args):
+    """
+    v9: the corrective test's fixed batches, one per observed episode of `items` ({episode: [(its call, other
+    episode, that one's aligned call)]}: failures with their aligned successes, or `success_side` of them): its calls
+    read with the references of train.py's validation per condition (real keeps the own variant's attempts,
+    novariant drops them, other_task, unaligned = real at random steps, none), its own chunks and the other's.
+    """
+    rng = np.random.default_rng(args.seed + 5)
+    batches = []
+    for e, its in sorted(items.items()):
+        frame = np.array([j for j, _, _ in its])
+        refs = {
+            "real": alignments.references(e, "real", rng, num=args.num_refs, full_pool=True, text=True, variant=True),
+            "novariant": alignments.references(e, "real", rng, num=args.num_refs, full_pool=True, text=True,
+                                               variant=False),
+            "other_task": alignments.references(e, "other_task", rng, num=args.num_refs, full_pool=True, text=True,
+                                                variant=True),
+        }
+        conditions = {c: make_plan(demos, [e], [refs[c if c in refs else "real"]], [c], [frame], rng, args)
+                      for c in CORR_CONDITIONS}
+        batches.append({"conditions": conditions, "own": conditions["real"]["chunks"],
+                        "alt": torch.stack([item_label(demos, o, t).to(demos.actions[e].dtype) for _, o, t in its]),
+                        "raw": default_collate([dataset[i] for i in conditions["real"]["indices"]])})
+    return batches
+
+
+def success_side(items):
+    """The corrective items seen from the successes: {S: [(S's call t, F, F's aligned call j)]}."""
+    out = collections.defaultdict(list)
+    for f, its in items.items():
+        for j, s, t in its:
+            out[s].append((t, f, j))
+    return dict(out)
+
+
+@torch.no_grad()
+def validate_corrective(policy, pace, batches, preprocessor, prompts, args, prefix="val_corr", own="F", alt="S",
+                        toward_alt=True):
+    """
+    v9 corrective test (prefix val_corr): at a held-out failure's observation, the loss (first n_action_steps steps)
+    of its own action F and of the aligned success's action S per condition, identical (noise, time) draws; the base
+    prefers F there (it produced it), and <prefix>_<c>_gain = (F - S)_c - (F - S)_none > 0 when the references pull
+    the prediction toward the success's way. Success side (prefix val_succ, own S, alt F, toward_alt False): at the
+    success's observation the base prefers S; gain = (F - S)_c - (F - S)_none must not turn negative (a correction
+    that also pulls successes off their way). se clustered by observed episode.
+    """
+    pace.adapter.eval()
+    head = args.n_action_steps or policy.config.n_action_steps
+    loss_own, loss_alt, sizes = collections.defaultdict(list), collections.defaultdict(list), []
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(args.seed + (6 if toward_alt else 8))
+        for b in batches:
+            batch_own = prepare(b["raw"], preprocessor, prompts, b["own"])
+            batch_alt = dict(batch_own)
+            batch_alt[ACTION] = b["alt"].to(batch_own[ACTION].device, batch_own[ACTION].dtype)
+            B = batch_own[ACTION].shape[0]
+            noise = torch.randn((args.repeats, B, policy.config.chunk_size, policy.config.max_action_dim),
+                                device="cuda")
+            time_ = policy.model.sample_time(args.repeats * B, "cuda").view(args.repeats, B)
+            for c, plan in b["conditions"].items():
+                exp = None if c == "none" else plan["exp"]
+                for table, batch in ((loss_own, batch_own), (loss_alt, batch_alt)):
+                    steps = scored_loss(policy, pace, batch, exp, args.repeats, noise=noise, time=time_, per_step=True)
+                    table[c].append(steps[:, :head].mean(dim=1).cpu())
+            sizes.append(B)
+    pace.adapter.train()
+    O = {c: torch.cat(v).double() for c, v in loss_own.items()}
+    A = {c: torch.cat(v).double() for c, v in loss_alt.items()}
+    owner = torch.cat([torch.full((n,), k) for k, n in enumerate(sizes)])
+    sign = 1.0 if toward_alt else -1.0
+    out = {f"{prefix}_calls": int(sum(sizes)), f"{prefix}_episodes": len(sizes)}
+    for c in O:
+        out[f"{prefix}_{c}_{own}"], out[f"{prefix}_{c}_{alt}"] = float(O[c].mean()), float(A[c].mean())
+        if c == "none":
+            continue
+        gain = sign * ((O[c] - A[c]) - (O["none"] - A["none"]))
+        per = torch.stack([gain[owner == k].mean() for k in range(len(sizes))])
+        out[f"{prefix}_{c}_gain"] = float(gain.mean())
+        out[f"{prefix}_{c}_gain_se"] = float(per.std() / math.sqrt(len(per))) if len(per) > 1 else float("nan")
+        out[f"{prefix}_{c}_{own}_rel"] = float(O[c].mean() / O["none"].mean() - 1)
+        out[f"{prefix}_{c}_{alt}_rel"] = float(A[c].mean() / A["none"].mean() - 1)
+    return out
+
+
+def validate_both_sides(policy, pace, batches, preprocessor, prompts, args):
+    """v9: the corrective test at the failures' observations (val_corr_*) and at the successes' (val_succ_*)."""
+    out = validate_corrective(policy, pace, batches[0], preprocessor, prompts, args)
+    out.update(validate_corrective(policy, pace, batches[1], preprocessor, prompts, args, prefix="val_succ", own="S",
+                                   alt="F", toward_alt=False))
+    return out
+
+
+def validate_recovery(policy, pace, batches, preprocessor, prompts, args):
+    """
+    v9 v2 recovery test (val_rec_*): at held-out successful branches' observations after their branch points, the loss
+    of the branch's own action S and of the failed branch's at the same call F per condition; gain = (F - S)_c -
+    (F - S)_none > 0 when the references move the prediction toward the way that succeeded, and val_rec_<c>_S_rel the
+    relative change of S's loss (real must beat other_task: the help has to come from the experience).
+    """
+    return validate_corrective(policy, pace, batches, preprocessor, prompts, args, prefix="val_rec", own="S", alt="F",
+                               toward_alt=False)
+
+
 def setup_distributed():
     """(rank, world size) under torchrun (NCCL, one GPU per process; long timeout: the others wait while rank 0 validates)."""
     world = int(os.environ.get("WORLD_SIZE", "1"))
@@ -957,6 +1357,65 @@ def main() -> None:
     parser.add_argument("--p_same_variant", type=float, default=0.5,
                         help="v7: probability that a sample's other attempts of its own variant stay candidates (a "
                              "closed-loop store holds them from the second round on)")
+    parser.add_argument("--ref_isolation", type=int, default=0,
+                        help="v8 (v2 encoder): the reference tokens carry the references only - the current call stays "
+                             "out of the encoder's context and of the summary (see core.ExperienceAdapter)")
+    parser.add_argument("--anchor_bad", type=float, default=0.0,
+                        help="v8: samples read with wrong references (other task, misaligned) train on this times "
+                             "|loss - host loss| instead of their loss: they must leave the host unchanged in either "
+                             "direction (0 = off: they train on their loss like the others)")
+    parser.add_argument("--adhere_symmetric", type=int, default=0,
+                        help="v8: the --adhere pace harm term penalizes a negative's loss moving away from the host's "
+                             "in either direction (|log ratio|) instead of only above it")
+    parser.add_argument("--p_corrective", type=float, default=0.0,
+                        help="v9 (rollouts): this fraction of each step's episodes are corrective samples - a mixed "
+                             "variant's failed attempt's calls just before it parts from a success, with the aligned "
+                             "success's actions as targets (corrective_items); also enables the corrective test")
+    parser.add_argument("--corr_thr", type=float, default=0.297,
+                        help="v9: parting threshold on the aligned robot-state distance (mean squared difference of "
+                             "the normalized states; the 95th percentile of success-to-success distances on the v7 "
+                             "rollouts, decision_diag.py)")
+    parser.add_argument("--corr_window", type=int, default=3, help="v9: calls before the parting call used")
+    parser.add_argument("--corr_label", choices=("parting", "same_phase", "branch"), default="parting",
+                        help="v9: the corrective target - S's call paired by the parting alignment (S aligned to F; "
+                             "ahead of F's progress in ~2/3 of the items), or S's step at F's own progress "
+                             "(same_phase: F aligned to S, as retrieval aligns), or the successful counterfactual "
+                             "branches' actions (branch: --branches)")
+    parser.add_argument("--branches", default="/root/pace/runs/branches_v10",
+                        help="v9 --corr_label branch: directory of branch_collect.py's files")
+    parser.add_argument("--branch_glob", default="branches_s[0-9]*_*.pt",
+                        help="v9 --corr_label branch: which of its files (default: the untagged ones, no smoke)")
+    parser.add_argument("--corr_relative", type=int, default=0,
+                        help="v9: a corrective sample's loss (or anchor) is divided by the host's loss on it and "
+                             "multiplied by --corr_scale, so it weighs as a plain sample (the host's loss there is "
+                             "~25x a plain sample's; 0 = absolute: the corrective calls take ~90%% of the gradient)")
+    parser.add_argument("--corr_scale", type=float, default=0.04,
+                        help="v9 --corr_relative: the plain samples' loss level (first-10-step loss ~0.035-0.045)")
+    parser.add_argument("--recovery", nargs="*", default=[],
+                        help="v9 v2: directories of rendered counterfactual branches (render_branches.py: "
+                             "<dir>/rollouts); their successful branches give recovery samples (recovery_items), "
+                             "never targets, references or validation episodes")
+    parser.add_argument("--p_recovery", type=float, default=0.0,
+                        help="v9 v2: this fraction of each step's episodes are recovery samples")
+    parser.add_argument("--rec_window", type=int, nargs=2, default=(2, 24),
+                        help="v9 v2: calls d after the branch point drawn with weight 1 (lo <= d < hi)")
+    parser.add_argument("--rec_tail", type=int, default=3,
+                        help="v9 v2: the last this many calls of a branch (the end of the task) weigh --rec_out_weight")
+    parser.add_argument("--rec_out_weight", type=float, default=0.25,
+                        help="v9 v2: draw weight of the calls outside the window (> 0)")
+    parser.add_argument("--rec_contrast", type=float, default=0.0,
+                        help="v9 v2: weight of the contrast term (the successful branch's action preferred over the "
+                             "failed branch's, beyond the host's preference, by --rec_margin); 0 = off")
+    parser.add_argument("--rec_margin", type=float, default=0.05, help="v9 v2: contrast margin (log ratio)")
+    parser.add_argument("--rec_val_points", type=int, default=64,
+                        help="v9 v2: held-out branch points of the recovery test (one successful branch each)")
+    parser.add_argument("--rec_val_calls", type=int, default=8, help="v9 v2: window calls per recovery-test branch")
+    parser.add_argument("--corr_val", type=int, default=0,
+                        help="v9: run the corrective test on the held-out mixed variants without corrective training")
+    parser.add_argument("--loss_steps", type=int, default=0,
+                        help="Train on the flow-matching loss of the first this many steps of each chunk only (0 = the "
+                             "whole chunk). v7: --n_action_steps, the steps a call's prediction executes in closed loop; "
+                             "the rest of a rollout's executed chunk came from later calls' plans")
     parser.add_argument("--max_same_variant", type=int, default=0,
                         help="v7: when a sample keeps its own variant's attempts, keep 1..this many of them at random "
                              "(a closed-loop run of R rounds stores at most R-1; 0 = all of them)")
@@ -1053,6 +1512,13 @@ def main() -> None:
                         help="v4 stages: generic = only the generic branch, every sample without references (stage 1); "
                              "reference = only the reference branch, the generic one frozen (stage 2, --init_from the "
                              "stage-1 adapter); all = both (joint)")
+    parser.add_argument("--resume", default=None,
+                        help="Continue a run in --out_dir from this adapter_step*.pt: its weights, the step count (LR "
+                             "schedule, remaining steps) and the best-so-far values of the run's train_log.jsonl; the "
+                             "optimizer state from out_dir/train_state.pt when it is of that step, else fresh AdamW "
+                             "moments with a --resume_warmup ramp. Batches and draws are new (not the lost ones)")
+    parser.add_argument("--resume_warmup", type=int, default=100,
+                        help="--resume without optimizer state: LR ramp over this many steps")
     parser.add_argument("--init_from", default=None,
                         help="Adapter checkpoint to start from (same configuration), e.g. the v4 stage-1 adapter")
     parser.add_argument("--group_size", type=int, default=4)
@@ -1126,8 +1592,58 @@ def main() -> None:
         others = task_sims.masked_fill(torch.eye(len(tasks), dtype=torch.bool), float("nan"))
         print(f"[v3] instruction similarity between different tasks: median {others.nanmedian():.3f}, max "
               f"{others.nan_to_num(-1).max():.3f}", flush=True)
-    alignments = Alignments(demos, universe, args, task_sims,
-                            only=sorted(set(train_indices) | set(val_indices)) if demos.rollouts else None)
+    # v9: corrective samples of the training mixed variants, the corrective test's of the held-out ones
+    corr_train, corr_val, succ_val = {}, {}, {}
+    if demos.rollouts and (args.p_corrective > 0 or args.corr_val):
+        kind = variant_outcomes(demos)
+        mixed = {v for v, k in kind.items() if k == "mixed"}
+        branch = args.corr_label == "branch"
+        # --corr_label branch: the aligned items (same phase) still give the success side of the corrective test
+        aligned_args = argparse.Namespace(**{**vars(args), "corr_label": "same_phase"}) if branch else args
+        for name, part in (("train", train_indices), ("val", val_indices)):
+            variants = mixed & {demos.variant[i] for i in part}
+            if name == "val" or not branch:
+                items, n_pairs, n_parted = corrective_items(demos, variants, aligned_args)
+                if name == "train":
+                    corr_train = items if args.p_corrective > 0 else {}
+                else:
+                    corr_val, succ_val = items, success_side(items)
+                print(f"[v9] corrective {name}: {sum(len(v) for v in items.values())} calls of {len(items)} "
+                      f"failures; {n_parted} of {n_pairs} success-failure pairs part (thr {args.corr_thr}, window "
+                      f"{args.corr_window})" + (" (the success side only)" if branch else ""), flush=True)
+            if branch:
+                items, n = branch_items(demos, variants, args)
+                if name == "train":
+                    corr_train = items if args.p_corrective > 0 else {}
+                else:
+                    corr_val = items
+                print(f"[v9] branch labels {name}: {n['points']} points ({n['files']} files) -> {n['labeled']} with "
+                      f"a successful branch ({n['succeeded']} of {n['branches']} branches), {len(items)} failures; "
+                      f"{n['mismatched']} mismatched", flush=True)
+                if name == "train" and args.p_corrective > 0 and not items:
+                    raise SystemExit(f"--corr_label branch: no labeled training points in {args.branches}/"
+                                     f"{args.branch_glob}")
+    # v9 v2: recovery samples of the training variants, the recovery test's of the held-out ones
+    rec_train, rec_val = {}, {}
+    if demos.rollouts and args.recovery:
+        variants = set(demos.variant)
+        for name, part in (("train", variants - demos.held_variants), ("val", variants & demos.held_variants)):
+            items, n = recovery_items(demos, part, args)
+            print(f"[v9b] recovery {name}: {n['branches']} successful branches of {n['points']} branch points "
+                  f"({n['no_success']} without, {n['with_failure']} with a rendered failed branch); {n['calls']} "
+                  f"calls after the branch points, {n['window_calls']} in the window {tuple(args.rec_window)}",
+                  flush=True)
+            if name == "train":
+                rec_train = items if args.p_recovery > 0 else {}
+            else:
+                rec_val = recovery_val_items(demos, items, args)
+                print(f"[v9b] recovery test: {sum(len(v) for v in rec_val.values())} calls of {len(rec_val)} "
+                      f"held-out branches", flush=True)
+        if args.p_recovery > 0 and not rec_train:
+            raise SystemExit(f"--p_recovery {args.p_recovery}: no successful rendered branch in {args.recovery}")
+    queries = set(train_indices) | set(val_indices) | set(corr_train) | set(corr_val) | set(succ_val) \
+        | set(rec_train) | set(rec_val)
+    alignments = Alignments(demos, universe, args, task_sims, only=sorted(queries) if demos.rollouts else None)
     print(f"episodes: train={len(train_indices)} val={len(val_indices)}"
           + (f" (targets: successful attempts; references: {len(universe)} attempts of the training variants)"
              if demos.rollouts else ""), flush=True)
@@ -1141,10 +1657,26 @@ def main() -> None:
                             feature_shapes=demos.feature_shapes(), enc_dim=args.enc_dim, enc_layers=args.enc_layers,
                             enc_heads=args.enc_heads, act_segments=args.act_segments, retrieval=args.retrieval,
                             generic=args.generic, generic_dim=args.generic_dim, generic_time=bool(args.generic_time),
-                            generic_cond_rank=args.generic_cond_rank, relevance=args.relevance)
+                            generic_cond_rank=args.generic_cond_rank, relevance=args.relevance,
+                            ref_isolation=bool(args.ref_isolation))
     if args.relevance == "gate" and args.generic == "none" and not args.rollouts:  # v7: the host fits its own rollouts
         print("[warn] --relevance gate without a generic branch: declining references then costs the domain "
               "adaptation the reference branch carries, so the gate may never learn to close", flush=True)
+    start_step, resume_state = 0, None
+    if args.resume:
+        ck = torch.load(args.resume, map_location="cpu", weights_only=False)
+        assert ck["config"] == adapter.config, f"{args.resume}: config {ck['config']} vs {adapter.config}"
+        adapter.load_state_dict(ck["state_dict"])
+        start_step = int(ck["step"])
+        state_path = out_dir / "train_state.pt"
+        if state_path.exists():
+            state = torch.load(state_path, map_location="cpu", weights_only=False)
+            resume_state = state if int(state["step"]) == start_step else None
+        print(f"[resume] adapter weights from {args.resume} (step {start_step}); optimizer state "
+              f"{'from ' + str(state_path) if resume_state else 'fresh (LR ramp over %d steps)' % args.resume_warmup}",
+              flush=True)
+        # new streams: the batches after the checkpoint are not the lost ones
+        draw_rng = np.random.default_rng((args.seed, 1000 + rank, start_step))
     if args.init_from:
         start = torch.load(args.init_from, map_location="cpu", weights_only=False)
         assert start["config"] == adapter.config, f"{args.init_from}: config {start['config']} vs {adapter.config}"
@@ -1162,7 +1694,7 @@ def main() -> None:
     if world > 1:
         for p in adapter.parameters():
             dist.broadcast(p.data, 0)
-        torch.manual_seed(args.seed + rank)  # different (noise, time) draws per process
+        torch.manual_seed(args.seed + rank + 7919 * start_step)  # different (noise, time) draws per process
         print(f"[dist] rank {rank}/{world} on {torch.cuda.get_device_name()}", flush=True)
     print(f"adapter parameters: {sum(p.numel() for p in params) / 1e6:.1f}M trained of "
           f"{sum(p.numel() for p in adapter.parameters()) / 1e6:.1f}M (encoder {adapter.encoder}, retrieval "
@@ -1170,13 +1702,20 @@ def main() -> None:
           f"config {adapter.config}", flush=True)
     optimizer = torch.optim.AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.95))
 
-    def lr_lambda(step):
+    def lr_lambda(local):
+        step = start_step + local  # --resume: the schedule continues at the checkpoint's step
         if step < args.warmup:
-            return (step + 1) / args.warmup
-        progress = (step - args.warmup) / max(1, args.steps - args.warmup)
-        return 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+            factor = (step + 1) / args.warmup
+        else:
+            progress = (step - args.warmup) / max(1, args.steps - args.warmup)
+            factor = 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
+        if start_step and resume_state is None:  # fresh moments: ramp up again
+            factor *= min(1.0, (local + 1) / max(1, args.resume_warmup))
+        return factor
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state["optimizer"])
     log = open(out_dir / "train_log.jsonl", "a") if rank == 0 else None
 
     def record(row):
@@ -1187,17 +1726,46 @@ def main() -> None:
         log.flush()
 
     target_p = target_weights(demos, train_indices, args)
+    corr_fails = sorted(corr_train)
+    n_corr = int(round(args.p_corrective * args.episodes_per_step)) if corr_fails else 0
+    rec_eps = sorted(rec_train)
+    n_rec = int(round(args.p_recovery * args.episodes_per_step)) if rec_eps else 0
+    rec_p = np.array([rec_train[e][3] for e in rec_eps]) if rec_eps else None
+    if rec_eps:
+        rec_p = rec_p / rec_p.sum()
+        print(f"[v9b] {n_rec} recovery samples of {args.episodes_per_step} episodes per step and process "
+              f"(contrast weight {args.rec_contrast}, margin {args.rec_margin})", flush=True)
 
     def draw():
+        n_plain = args.episodes_per_step - n_corr - n_rec
         if target_p is None:
-            picks = draw_rng.integers(len(train_indices), size=args.episodes_per_step)
+            picks = draw_rng.integers(len(train_indices), size=n_plain)
         else:  # v7 --mixed_weight
-            picks = draw_rng.choice(len(train_indices), size=args.episodes_per_step, p=target_p)
+            picks = draw_rng.choice(len(train_indices), size=n_plain, p=target_p)
         episodes = [train_indices[k] for k in picks]
+        frames = [sample_frames(demos.actions[e].shape[0], args.group_size, draw_rng) for e in episodes]
+        targets = [None] * len(episodes)
+        for _ in range(n_corr):  # v9: a failure's corrective calls, the aligned success's actions as targets
+            f = corr_fails[int(draw_rng.integers(len(corr_fails)))]
+            its = corr_train[f]
+            chosen = [its[k] for k in draw_rng.choice(len(its), size=args.group_size,
+                                                      replace=len(its) < args.group_size)]
+            episodes.append(f)
+            frames.append(np.array([j for j, _, _ in chosen]))
+            targets.append(torch.stack([item_label(demos, s, t).to(demos.actions[f].dtype) for _, s, t in chosen]))
+        alts = [False] * len(episodes)
+        for _ in range(n_rec):  # v9 v2: a successful branch's calls after its branch point, its own chunks as targets
+            e = rec_eps[int(draw_rng.choice(len(rec_eps), p=rec_p))]
+            calls, w, alt, _ = rec_train[e]
+            k = draw_rng.choice(len(calls), size=args.group_size, replace=len(calls) < args.group_size, p=w / w.sum())
+            frame = np.sort(calls[k])
+            episodes.append(e)
+            frames.append(frame)
+            targets.append(None)
+            alts.append(recovery_contrast(demos, alt, frame))
         conditions = [alignments.training_condition(draw_rng) for _ in episodes]
         refs = [alignments.references(e, "real" if c == "unaligned" else c, draw_rng)
                 for e, c in zip(episodes, conditions)]
-        frames = [sample_frames(demos.actions[e].shape[0], args.group_size, draw_rng) for e in episodes]
         negs = []
         for e, c, ref in zip(episodes, conditions, refs):
             if args.adhere == "none" or c != args.ref_content or ref is None:
@@ -1206,9 +1774,9 @@ def main() -> None:
             other = alignments.references(e, "other_task", draw_rng) \
                 if alignments.has_other_tasks and draw_rng.random() < args.p_neg_other else None
             negs.append((other, False) if other is not None else (ref, True))
-        return make_plan(demos, episodes, refs, conditions, frames, draw_rng, args, negs)
+        return make_plan(demos, episodes, refs, conditions, frames, draw_rng, args, negs, targets, alts)
 
-    sampler = PlanSampler(draw, args.steps)
+    sampler = PlanSampler(draw, args.steps - start_step)
     loader = DataLoader(dataset, batch_sampler=sampler, num_workers=args.num_workers, collate_fn=default_collate,
                         persistent_workers=False)
     # Fork the loader's workers BEFORE this process decodes any video: lerobot keeps open torchcodec decoders in a
@@ -1220,18 +1788,42 @@ def main() -> None:
     if demos.rollouts:  # v7: the held-out successes of mixed variants, reported apart (val10_mixed_*)
         kind = variant_outcomes(demos)
         mixed_val = {i for i in val_indices if kind[demos.variant[i]] == "mixed"}
+    corr_batches = rec_batches = None
     if rank == 0:  # validation, logging and saving are rank 0's; the others wait in the next gradient all-reduce
         val_dataset = make_dataset()
         val_batches = build_validation(demos, alignments, val_indices, val_dataset, args)
+        if corr_val:  # failure side (the correction) and success side (the successes must keep their way)
+            corr_batches = (build_corrective_validation(demos, alignments, corr_val, val_dataset, args),
+                            build_corrective_validation(demos, alignments, succ_val, val_dataset, args))
+        if rec_val:  # v9 v2: the recovery test
+            rec_batches = build_corrective_validation(demos, alignments, rec_val, val_dataset, args)
         val = validate(policy, pace, val_batches, preprocessor, prompts, args, mixed=mixed_val)
-        record({"step": 0, **val})  # zero-initialized adapter: every condition equals `none` here
+        if corr_batches:
+            val.update(validate_both_sides(policy, pace, corr_batches, preprocessor, prompts, args))
+        if rec_batches:
+            val.update(validate_recovery(policy, pace, rec_batches, preprocessor, prompts, args))
+        if not start_step:
+            record({"step": 0, **val})  # zero-initialized adapter: every condition equals `none` here
+        else:  # must reproduce the checkpoint's own validation
+            print("[resume] validation at the checkpoint:",
+                  {k: round(val[k], 5) for k in ("val10_real", "val10_none", "val_rec_real_gain") if k in val}, flush=True)
+    best_corr = best_rec = float("-inf")
     running, started = collections.defaultdict(float), time.time()
     relevance_running, relevance_steps = collections.defaultdict(float), 0
     best_val = val.get("val_none", float("inf")) if args.train_parts == "generic" else float("inf")
-    for step, raw in enumerate(batches, 1):
+    if start_step and (out_dir / "train_log.jsonl").exists():  # --resume: the run's best values up to its step
+        for line in open(out_dir / "train_log.jsonl"):
+            row = json.loads(line)
+            if row.get("step", 0) > start_step:
+                continue
+            best_corr = max(best_corr, row.get("best_val_corr_real_gain", float("-inf")))
+            best_rec = max(best_rec, row.get("best_val_rec_real_gain", float("-inf")))
+            best_val = min(best_val, row.get("best_val10_real", row.get("best_val_none", float("inf"))))
+        print(f"[resume] best so far: val10_real {best_val}, rec gain {best_rec}, corr gain {best_corr}", flush=True)
+    for step, raw in enumerate(batches, start_step + 1):
         plan = sampler.plans.popleft()
         batch = prepare(raw, preprocessor, prompts, plan["chunks"])
-        if args.check_every and (step == 1 or step % args.check_every == 0):
+        if args.check_every and (step == start_step + 1 or step % args.check_every == 0):
             check_chunks(batch, plan, step)
         optimizer.zero_grad(set_to_none=True)
         loss, backward, stats, relevance = training_loss(policy, pace, batch, plan, args)
@@ -1263,7 +1855,7 @@ def main() -> None:
             averaged = {k: running.pop(k) / args.log_every for k in list(running) if not k.startswith("n_")}
             record({
                 "step": step, **averaged, "lr": scheduler.get_last_lr()[0],
-                "grad_norm": grad_norm, "steps_per_s": step / (time.time() - started),
+                "grad_norm": grad_norm, "steps_per_s": (step - start_step) / (time.time() - started),
                 "max_mem_gb": torch.cuda.max_memory_allocated() / 2 ** 30,
                 "gate_mean": float(np.mean(list(gates.values()))), "gate_max": float(np.max(np.abs(list(gates.values())))),
                 **({"generic_gate_mean": float(np.mean(list(adapter.generic_gates().values())))}
@@ -1277,7 +1869,25 @@ def main() -> None:
             relevance_steps = 0
         if rank == 0 and (step % args.val_every == 0 or step == args.steps):
             val = validate(policy, pace, val_batches, preprocessor, prompts, args, mixed=mixed_val)
+            if corr_batches:
+                val.update(validate_both_sides(policy, pace, corr_batches, preprocessor, prompts, args))
+            if rec_batches:
+                val.update(validate_recovery(policy, pace, rec_batches, preprocessor, prompts, args))
             record({"step": step, **val, **adapter.gates(), **adapter.generic_gates()})
+            if rec_batches and val["val_rec_real_gain"] > best_rec:  # v9 v2: the largest recovery-test gain
+                best_rec = val["val_rec_real_gain"]
+                save_adapter(adapter, out_dir / "adapter_best_rec.pt", step=step, args=vars(args), val=val,
+                             policy_path=args.policy_path, key_info=store.info, vmax=args.vmax, gamma=args.gamma,
+                             align=args.align, retrieval=args.retrieval, generic=args.generic,
+                             train_parts=args.train_parts)
+                record({"step": step, "best_val_rec_real_gain": best_rec, "saved": "adapter_best_rec.pt"})
+            if corr_batches and val["val_corr_real_gain"] > best_corr:  # v9: the largest corrective gain
+                best_corr = val["val_corr_real_gain"]
+                save_adapter(adapter, out_dir / "adapter_best_corr.pt", step=step, args=vars(args), val=val,
+                             policy_path=args.policy_path, key_info=store.info, vmax=args.vmax, gamma=args.gamma,
+                             align=args.align, retrieval=args.retrieval, generic=args.generic,
+                             train_parts=args.train_parts)
+                record({"step": step, "best_val_corr_real_gain": best_corr, "saved": "adapter_best_corr.pt"})
             # keep the adapter with the lowest held-out loss (it may overfit later): stage 1 of v4 (a plain fine-tune)
             # by val_none; v7 (a few thousand rollouts) by val10_real (the executed first steps of a prediction)
             best_key = "val_none" if args.train_parts == "generic" else ("val10_real" if demos.rollouts else None)
@@ -1294,6 +1904,9 @@ def main() -> None:
                      "retrieval": args.retrieval, "generic": args.generic, "train_parts": args.train_parts}
             save_adapter(adapter, out_dir / f"adapter_step{step:06d}.pt", **extra)
             save_adapter(adapter, out_dir / "adapter_last.pt", **extra)
+            # --resume: the optimizer state of the latest save (written beside, then renamed)
+            torch.save({"step": step, "optimizer": optimizer.state_dict()}, out_dir / "train_state.pt.tmp")
+            os.replace(out_dir / "train_state.pt.tmp", out_dir / "train_state.pt")
     if log:
         log.close()
     if world > 1:

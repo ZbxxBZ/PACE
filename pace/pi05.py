@@ -243,12 +243,14 @@ def build_adapter(policy, inject_layers=("every2",), max_refs: int = 8, input_in
                   encoder: str = "v1", feature_shapes=None, enc_dim: int = 512, enc_layers: int = 2,
                   enc_heads: int = 8, act_segments: int = 10, retrieval: str = "classic", generic: str = "none",
                   generic_dim: int = 256, generic_time: bool = True,
-                  generic_cond_rank: int = 64, relevance: str = "none") -> ExperienceAdapter:
+                  generic_cond_rank: int = 64, relevance: str = "none",
+                  ref_isolation: bool = False) -> ExperienceAdapter:
     """
     `feature_shapes` = ((V, Dv), Ds) of the library's image tokens and states (required by the v2 encoder);
     `retrieval` fixes the per-reference scalars the adapter reads (classic: SCALAR_NAMES, v3: V3_SCALAR_NAMES);
     `generic` "mlp" adds the v4 reference-independent branch (`core.GenericResidual`); `relevance` "gate" the v6
-    per-reference relevance gate (the reference branch can decline its references).
+    per-reference relevance gate (the reference branch can decline its references); `ref_isolation` (v8) keeps the
+    current call out of the reference tokens (`core.ExperienceAdapter`).
     """
     assert retrieval in RETRIEVALS, f"Unknown retrieval {retrieval}"
     dims = policy_dims(policy)
@@ -264,7 +266,8 @@ def build_adapter(policy, inject_layers=("every2",), max_refs: int = 8, input_in
         chunk_len=dims["chunk_len"], max_refs=max_refs, input_inject=input_inject, position=position,
         time_cond=time_cond, cond_dim=dims["hidden_size"], encoder=encoder,
         scalar_names=V3_SCALAR_NAMES if retrieval == "v3" else SCALAR_NAMES, generic=generic, generic_dim=generic_dim,
-        generic_time=generic_time, generic_cond_rank=generic_cond_rank, relevance=relevance, **v2,
+        generic_time=generic_time, generic_cond_rank=generic_cond_rank, relevance=relevance,
+        ref_isolation=ref_isolation, **v2,
     )
 
 
