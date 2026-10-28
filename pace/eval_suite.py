@@ -30,6 +30,12 @@ with the v2 encoder the policy runs as the base policy, every rollout is stored 
 chunks, and every policy call's observation goes to <out_dir>/rollouts/frames_<tag>.pt; the rounds are then repeated
 attempts (the policy's noise draws differ between rounds).
 
+V10-0 (--follow 1, pace/follow.py): a non-learned follower at the policy output replays, aligned on the robot state,
+the run's own stored success of the same instruction and physical setup (robot state and wrist image at call 0;
+pace/follow.py); needs
+--pace.accumulate and stored robot states (--pace.record_features with --pace.condition none: the base policy plus
+the follower).
+
     python -m pace.eval_suite --env_type libero_plus --suite libero_10 --per_category 40 --out_dir eval/plus_l10_base
     python -m pace.eval_suite ... --pace.condition real --pace.library libs/l10.pt --pace.adapter runs/x/adapter_last.pt
 """
@@ -110,6 +116,8 @@ def main() -> None:
     parser.add_argument("--per_category", type=int, default=40, help="libero_plus sample size per category")
     parser.add_argument("--sample_seed", type=int, default=0)
     parser.add_argument("--episodes", type=int, default=1, help="Episodes per task (libero: init states 0..n-1)")
+    parser.add_argument("--init_indices", type=int, nargs="+", default=None,
+                        help="Init states to run every variant from (instead of 0..--episodes-1; V10 shift test)")
     parser.add_argument("--fix_language", type=int, default=None, help="Default: 1 for libero_plus, 0 for libero")
     parser.add_argument("--batch_size", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1000)
@@ -121,9 +129,25 @@ def main() -> None:
                         help="v7 training data: also record every policy call's observation next to the rollouts "
                              "(pace.rollouts; needs --pace.accumulate and an adapter with the v2 encoder, run with "
                              "--pace.condition none so the policy runs as the base policy)")
+    parser.add_argument("--follow", type=int, default=0, help="V10-0 follower (pace/follow.py)")
+    parser.add_argument("--follow.max_dist", dest="follow_max_dist", type=float, default=0.02,
+                        help="Lost (back to the base policy) when the matched reference call's end effector is farther "
+                             "than this (metres)")
+    parser.add_argument("--follow.window", dest="follow_window", type=int, default=3,
+                        help="The matched reference call is one of the next this many")
+    parser.add_argument("--follow.setup_tol", dest="follow_setup_tol", type=float, default=1e-3,
+                        help="Same physical setup: max |diff| of the call-0 robot states (env units) below this")
+    parser.add_argument("--follow.wrist_cos", dest="follow_wrist_cos", type=float, default=0.999,
+                        help="... and call-0 wrist-camera image tokens at least this close (mean cell cosine)")
+    parser.add_argument("--follow.exact_cos", dest="follow_exact_cos", type=float, default=0.99999,
+                        help="Exact scene (both cameras): preferred reference; failure memory")
+    parser.add_argument("--follow.cross_only", dest="follow_cross_only", type=int, default=0,
+                        help="Never follow an exact scene match (the variant's own earlier successes)")
     add_pace_args(parser, condition_default=None)
     args = parser.parse_args()
     use_pace = args.condition is not None
+    if args.follow and not (use_pace and args.accumulate):
+        raise SystemExit("--follow needs --pace.accumulate (it follows the run's own stored successes)")
     if args.record_frames and not (use_pace and args.accumulate):
         raise SystemExit("--record_frames needs --pace.accumulate (the frames are stored next to the rollouts)")
     fix_language = bool(args.env_type == "libero_plus" if args.fix_language is None else args.fix_language)
@@ -165,10 +189,11 @@ def main() -> None:
         shown = task.language
         if fix_language:
             shown = task.language if cat == LANGUAGE_CATEGORY else base
-        for ep in range(args.episodes):
+        for ep in (args.init_indices if args.init_indices else range(args.episodes)):
             entries.append({"task_id": tid, "name": task.name, "category": cat, "difficulty": diff, "base": base,
                             "shown": shown, "raw_language": task.language, "init_index": ep})
-    print(f"[suite] {args.env_type}/{args.suite}: {len(task_ids)} variants x {args.episodes} = {len(entries)} "
+    print(f"[suite] {args.env_type}/{args.suite}: {len(task_ids)} variants x "
+          f"{args.init_indices or args.episodes} = {len(entries)} "
           f"episodes, batch {args.batch_size}, fix_language={fix_language}", flush=True)
     print("[suite] e.g.", [(e["category"], e["raw_language"][:70], "->", e["shown"][:70]) for e in entries[:3]],
           flush=True)
@@ -181,6 +206,13 @@ def main() -> None:
         preprocessor_overrides={"device_processor": {"device": "cuda"}, "rename_observations_processor": {"rename_map": {}}},
     )
     env_pre, env_post = make_env_pre_post_processors(env_cfg, policy.config)
+    follower = None
+    if args.follow:  # before PACE attaches: PACE then records what the follower returns (the executed chunks)
+        from .follow import Follower
+
+        follower = Follower(policy, preprocessor, max_dist=args.follow_max_dist, window=args.follow_window,
+                            setup_tol=args.follow_setup_tol, wrist_cos=args.follow_wrist_cos,
+                            exact_cos=args.follow_exact_cos, cross_only=bool(args.follow_cross_only))
     rollout_dir = out_dir / "rollouts"
     if use_pace and args.accumulate:  # resume: the rollouts an earlier (interrupted) run stored, after the library
         previous = rollout_files(rollout_dir)
@@ -190,6 +222,8 @@ def main() -> None:
     log = open(out_dir / "episodes.jsonl", "a")
     if use_pace:
         pace = attach_pace(policy, args)
+        if follower is not None:
+            follower.bind(pace)
         if args.record_frames and not pace.features:
             raise SystemExit("--record_frames: the rollouts need image tokens (training data for the v2 encoder); "
                              "pass an adapter with the v2 encoder or --pace.record_features (--pace.condition none keeps "
@@ -266,6 +300,10 @@ def main() -> None:
         rows = [json.loads(l) for l in open(out_dir / "episodes.jsonl")]
         this_round = [r for r in rows if r.get("round", 1) == rnd]
         store = f", store {len(pace.store)} episodes" if use_pace and pace.store is not None else ""
+        if follower is not None:
+            fol = [r.get("follow", {}) for r in runner.last_rows]
+            store += (f", followed {sum(f.get('followed_calls', 0) > 0 for f in fol)}/{len(fol)} "
+                      f"({sum(f.get('status') == 'lost' for f in fol)} lost)")
         print(f"[suite] batch {b + 1}/{len(batches)}: round {rnd} {len(this_round)} episodes, success "
               f"{100 * np.mean([r['success'] for r in this_round]):.1f}%{store} ({time.time() - started:.0f}s)",
               flush=True)
