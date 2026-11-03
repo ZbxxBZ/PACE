@@ -59,6 +59,8 @@ def apply(inner, p):
     m.cam_pos[cid] = m.cam_pos[cid] + np.array(p["cam_dpos"])
     h = np.deg2rad(p["cam_angle"]) / 2
     m.cam_quat[cid] = _qmul(np.r_[np.cos(h), np.sin(h) * np.array(p["cam_axis"])], m.cam_quat[cid])
+    if p.get("cam_wide"):  # 11-01, V11b: the kinds of camera change LIBERO-plus has, with our own random values
+        m.cam_pos[cid], m.cam_quat[cid] = wide_pose(type(inner), m.cam_pos[cid], m.cam_quat[cid], p["cam_wide"])
     for i in range(m.nlight):
         m.light_diffuse[i] = np.clip(m.light_diffuse[i] * p["light"] * np.array(p["tint"]), 0, 1)
         d = m.light_dir[i] + np.array(p["light_dir"])
@@ -71,6 +73,43 @@ def apply(inner, p):
         if any(k in name for k in SURF_KEYS):
             m.mat_rgba[i, :3] = np.clip(m.mat_rgba[i, :3] * np.array(p["surf"]), 0, 1)
     inner.sim.forward()
+
+
+def sample_wide(rng):
+    """Orbit around the scene 60% (15-75 deg, half of them also raised 5-15 deg), farther away 20%, turned in place 20%."""
+    w = dict(h=0.0, v=0.0, sc=1.0, er=0.0, ev=0.0)
+    u = rng.random()
+    if u < 0.6:
+        w["h"] = float(rng.uniform(15, 75) * rng.choice([-1, 1]))
+        if rng.random() < 0.5:
+            w["v"] = float(rng.uniform(5, 15))
+    elif u < 0.8:
+        w["sc"] = float(rng.uniform(1.15, 1.8))
+    else:
+        w["er"], w["ev"] = [float(x) for x in rng.uniform(-10, 10, 2)]
+    return w
+
+
+def wide_pose(cls, pos, quat, w):
+    """cam_wide -> agentview pose, in the order of the scene's _setup_camera and with its own rotation helpers."""
+    import sys
+
+    mod = sys.modules[cls.__module__]
+    pos, quat = [float(x) for x in pos], [float(x) for x in quat]
+    if w["v"]:
+        r = mod.rotate_around_y(original_quat=quat, original_pos=pos, degrees=w["v"])
+        pos, quat = r["new_pos"], r["new_quat"]
+    if w["h"]:
+        r = mod.rotate_around_z(original_quat=quat, original_pos=pos, degrees=w["h"])
+        pos, quat = r["new_pos"], r["new_quat"]
+    if w["sc"] != 1.0:
+        r = mod.scale_distance_from_pivot(original_quat=quat, original_pos=pos, scale_factor=w["sc"])
+        pos, quat = r["new_pos"], r["new_quat"]
+    if w["er"]:
+        quat = mod.rotate_around_z(original_quat=quat, degrees=w["er"])["new_quat"]
+    if w["ev"]:
+        quat = mod.rotate_around_y(original_quat=quat, degrees=w["ev"])["new_quat"]
+    return np.array(pos), np.array(quat)
 
 
 def pixels(img, p, rng):

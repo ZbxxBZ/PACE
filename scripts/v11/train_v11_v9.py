@@ -220,7 +220,7 @@ class Runner:
                                      position="post_layer", time_cond=False, encoder="v2",
                                      feature_shapes=((32, 2048), 8), enc_dim=512, enc_layers=2, enc_heads=8,
                                      act_segments=10, retrieval="classic", generic="none", relevance="gate",
-                                     ref_isolation=True)
+                                     ref_isolation=getattr(args, "ref_isolation", "on") == "on")
         self.pace = PI05Experience(self.policy, self.adapter, runtime_kwargs={"retrieval": "classic"})
         self.pace.attach()
         self.device = self.pace.device
@@ -346,6 +346,8 @@ def main():
     ap.add_argument("--eval_every", type=int, default=500)
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--ref_isolation", choices=("on", "off"), default="on",
+                    help="off (11-01, V11b): reference tokens see the current call (encoder, relevance gate)")
     ap.add_argument("--smoke", action="store_true", help="20 steps, 16 validation samples per mode")
     args = ap.parse_args()
     if args.smoke:
