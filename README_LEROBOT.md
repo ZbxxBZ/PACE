@@ -1,4 +1,10 @@
-# PACE — LeRobot-π0.5 snapshot (V8–V11, frozen 2026-10-28)
+# PACE V11 — LeRobot-π0.5 base
+
+Branch `v11`: V10 plus the V11 residual branch and its closed loops and diagnostics as they ran up to 2026-11-01, before
+any V11b change (`train_v11_v9.py` without `--ref_isolation`, `augment.py` without the wide camera). V10 alone is on branch
+`v10`, V11b on `v11b`.
+
+## LeRobot-π0.5 snapshot (V8–V11)
 
 This branch freezes the code of every PACE version that ran on the LeRobot port of π0.5,
 `lerobot/pi05_libero_finetuned` (LeRobot's own LIBERO fine-tune: 50-step action chunks, 10 executed per call,
@@ -12,7 +18,7 @@ other branches. Numbers obtained with this snapshot must not be mixed with offic
 | `scripts/v10/` | V10 premise checks and upper bounds: oracle shift / noise, localization probe, reference keys. |
 | `scripts/v10b/` | V10 data line and method: π0.5 references and self-evaluation, pair collection, augmentation, replay rendering, feature extraction, the comparator (`train_v10b.py`), value head (`fit_value_low.py`), closed loops (`closed_loop_v3.py` = V10-3-1 hard follow, `closed_loop_v32.py` = V10-3-2 soft follow). |
 | `scripts/v10pro/` | LIBERO-Pro side line (reported only). |
-| `scripts/v11/` | V11: residual branch on π0.5's action with V9's structure (`train_v11_v9.py`), its external-comparator control (`train_v11_cmp.py`), signal checks and clear-view labels. |
+| `scripts/v11/` | V11: residual branch on π0.5's action with V9's structure (`train_v11_v9.py`), its external-comparator control (`train_v11_cmp.py`), signal checks and clear-view labels; closed loop (`closed_loop_v11.py`: camera, non-camera, `--inits`, `--one_per_cell`), variance-shrink head (`train_v11_var.py`), branch path and copy probes (`v11_paths.py`, `v11_copy.py`), goal-in-view checks (`v11_inview*.py`, `v11_outframe_select.py`), the living-room-5 probe (`lr5_probe.py`). |
 
 The commit before this one keeps a local working copy of `pace/core.py`, `pace/pi05.py`, `pace/train.py` as they were
 on the development machine. Machine-specific transfer and setup scripts are not included. Third-party code
